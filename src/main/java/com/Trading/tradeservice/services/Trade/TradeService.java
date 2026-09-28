@@ -8,6 +8,10 @@ import com.Trading.tradeservice.dtos.Request.TradeRequest;
 import com.Trading.tradeservice.dtos.Response.TradeResponse;
 import com.Trading.tradeservice.events.tradeEvent;
 import com.Trading.tradeservice.models.*;
+import com.Trading.tradeservice.outbox.OutboxEvent;
+import com.Trading.tradeservice.outbox.OutboxPublisherService;
+import com.Trading.tradeservice.outbox.OutboxRepository;
+import com.Trading.tradeservice.outbox.OutboxService;
 import com.Trading.tradeservice.respositories.IdempotencyKeyRepository;
 import com.Trading.tradeservice.respositories.TradeAuditRepository;
 import com.Trading.tradeservice.respositories.Traderepository;
@@ -15,7 +19,6 @@ import com.Trading.tradeservice.validation.TradeValidator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
@@ -35,25 +38,31 @@ public class TradeService {
     private final Traderepository tradeRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final TradeAuditRepository tradeAuditRepository;
-    private final KafkaTemplate<String, tradeEvent> kafkaTemplate;
+    private final OutboxService outboxService;
+    private final OutboxPublisherService outboxPublisherService;
+    private final OutboxRepository outboxRepository;
     private final ObjectMapper objectMapper;
 
     public TradeService(TradeValidator tradeValidator,
                         Traderepository tradeRepository,
                         IdempotencyKeyRepository idempotencyKeyRepository,
                         TradeAuditRepository tradeAuditRepository,
-                        KafkaTemplate<String, tradeEvent> kafkaTemplate,
+                        OutboxService outboxService,
+                        OutboxPublisherService outboxPublisherService,
+                        OutboxRepository outboxRepository,
                         ObjectMapper objectMapper) {
         this.tradeValidator = tradeValidator;
         this.tradeRepository = tradeRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
         this.tradeAuditRepository = tradeAuditRepository;
-        this.kafkaTemplate = kafkaTemplate;
+        this.outboxService = outboxService;
+        this.outboxPublisherService = outboxPublisherService;
+        this.outboxRepository = outboxRepository;
         this.objectMapper = objectMapper;
     }
 
     /**
-     * 1. CREATE TRADE (with Validation, Idempotency, Audit, and Kafka publishing)
+     * 1. CREATE TRADE (with Validation, Idempotency, Transactional Outbox, Audit, and Kafka publishing)
      */
     public TradeResponse captureTrade(String idempotencyKey, TradeRequest tradeRequest) throws JsonProcessingException {
         // Validation
@@ -98,8 +107,8 @@ public class TradeService {
                 "Trade created: " + savedTrade.getTrade_type() + " " + savedTrade.getQuantity() + " "
                         + savedTrade.getCommodity() + " @ " + savedTrade.getPrice() + " at " + savedTrade.getLocation());
 
-        // Publish to Kafka
-        publishTradeEvent("trade-created", savedTrade);
+        // Transactional Outbox: Writes event inside the SAME database transaction
+        queueOutboxAndPublish("TRADE_CREATED", "trade-created", savedTrade);
 
         return mapToResponse(savedTrade);
     }
@@ -115,7 +124,7 @@ public class TradeService {
     }
 
     /**
-     * 2. GET ALL TRADES (with optional status / commodity filter)
+     * 2. GET ALL TRADES
      */
     @Transactional(readOnly = true)
     public List<TradeResponse> getAllTrades() {
@@ -126,10 +135,9 @@ public class TradeService {
     }
 
     /**
-     * 3. UPDATE TRADE (with Validation, Optimistic Locking, Lifecycle Check, Audit, and Kafka event)
+     * 3. UPDATE TRADE (with Validation, Optimistic Locking, Lifecycle Check, Outbox, and Audit)
      */
     public TradeResponse updateTrade(Long tradeId, TradeRequest updateRequest) {
-        // Validation
         tradeValidator.validateUpdate(updateRequest);
 
         Trade existingTrade = tradeRepository.findById(tradeId)
@@ -166,14 +174,14 @@ public class TradeService {
         recordAudit(savedTrade.getId(), "UPDATE", savedTrade.getStatus(), savedTrade.getStatus(), savedTrade.getVersion(),
                 "Updated trade from [" + oldDetails + "] to [" + summarizeTrade(savedTrade) + "]");
 
-        // Publish event for position service recalculation
-        publishTradeEvent("trade-created", savedTrade);
+        // Transactional Outbox for position service recalculation
+        queueOutboxAndPublish("TRADE_UPDATED", "trade-created", savedTrade);
 
         return mapToResponse(savedTrade);
     }
 
     /**
-     * 4. CANCEL TRADE (Business cancellation instead of hard delete, with lifecycle check and audit)
+     * 4. CANCEL TRADE (Business cancellation with Outbox and Audit trail)
      */
     public TradeResponse cancelTrade(Long tradeId, Long version, String reason) {
         Trade existingTrade = tradeRepository.findById(tradeId)
@@ -204,8 +212,8 @@ public class TradeService {
         recordAudit(savedTrade.getId(), "CANCEL", oldStatus, TradeStatus.CANCELLED.name(), savedTrade.getVersion(),
                 "Trade cancelled. Reason: " + (reason != null ? reason : "User initiated cancellation"));
 
-        // Notify Kafka
-        publishTradeEvent("trade-created", savedTrade);
+        // Transactional Outbox: Notify downstream consumers of cancellation
+        queueOutboxAndPublish("TRADE_CANCELLED", "trade-created", savedTrade);
 
         return mapToResponse(savedTrade);
     }
@@ -254,6 +262,35 @@ public class TradeService {
         return tradeAuditRepository.findByTradeIdOrderByTimestampDesc(tradeId);
     }
 
+    /**
+     * OUTBOX HISTORY RETRIEVAL
+     */
+    @Transactional(readOnly = true)
+    public List<OutboxEvent> getAllOutboxEvents() {
+        return outboxRepository.findAll();
+    }
+
+    // Helper: Saves event to transactional outbox table and attempts immediate publish
+    private void queueOutboxAndPublish(String eventType, String topic, Trade trade) {
+        tradeEvent event = new tradeEvent();
+        event.setTradeId(trade.getId());
+        event.setTradeType(trade.getTrade_type() != null ? trade.getTrade_type().name() : "BUY");
+        event.setCommodity(trade.getCommodity());
+        event.setQuantity(trade.getQuantity() != null ? trade.getQuantity() : 0.0);
+        event.setPrice(trade.getPrice() != null ? trade.getPrice() : 0.0);
+        event.setCurrency(trade.getCurrency());
+        event.setCounterpartyId(trade.getCounterparty_id());
+        event.setLocation(trade.getLocation() != null ? trade.getLocation() : "DEFAULT");
+        event.setTradeDate(trade.getTradeDate() != null ? trade.getTradeDate() : java.time.LocalDate.now());
+        event.setDeliveryDate(trade.getTradeDate() != null ? trade.getTradeDate() : java.time.LocalDate.now());
+
+        // 1. Transactional Outbox (Guarantees zero lost events even if Kafka is down)
+        OutboxEvent outboxEvent = outboxService.saveEvent("TRADE", trade.getId(), eventType, topic, event);
+
+        // 2. Immediate asynchronous dispatch (background poller retries if Kafka is offline)
+        outboxPublisherService.publishEvent(outboxEvent);
+    }
+
     // Helper: Record Audit Entry
     private void recordAudit(Long tradeId, String action, String oldStatus, String newStatus, Long version, String details) {
         String username = getCurrentUsername();
@@ -277,28 +314,6 @@ public class TradeService {
             return auth.getName();
         }
         return "SYSTEM";
-    }
-
-    // Helper: Publish Kafka event to keep position-service synchronized
-    private void publishTradeEvent(String topic, Trade trade) {
-        try {
-            tradeEvent event = new tradeEvent();
-            event.setTradeId(trade.getId());
-            event.setTradeType(trade.getTrade_type() != null ? trade.getTrade_type().name() : "BUY");
-            event.setCommodity(trade.getCommodity());
-            event.setQuantity(trade.getQuantity() != null ? trade.getQuantity() : 0.0);
-            event.setPrice(trade.getPrice() != null ? trade.getPrice() : 0.0);
-            event.setCurrency(trade.getCurrency());
-            event.setCounterpartyId(trade.getCounterparty_id());
-            event.setLocation(trade.getLocation() != null ? trade.getLocation() : "DEFAULT");
-            event.setTradeDate(trade.getTradeDate() != null ? trade.getTradeDate() : java.time.LocalDate.now());
-            event.setDeliveryDate(trade.getTradeDate() != null ? trade.getTradeDate() : java.time.LocalDate.now());
-
-            kafkaTemplate.send(topic, String.valueOf(event.getTradeId()), event);
-            log.info("Sent Kafka trade event for Trade ID: {} to topic: {}", trade.getId(), topic);
-        } catch (Exception ex) {
-            log.error("Failed to publish Kafka event for trade ID {}: {}", trade.getId(), ex.getMessage());
-        }
     }
 
     private String calculateHash(TradeRequest tradeRequest) {

@@ -130,4 +130,14 @@ public class tradeControllers {
         List<TradeAudit> auditHistory = tradeService.getTradeAuditHistory(tradeId);
         return ResponseEntity.ok(auditHistory);
     }
+
+    /**
+     * 9. TRANSACTIONAL OUTBOX MONITORING (Real-time status: PENDING, SENT, FAILED)
+     */
+    @PreAuthorize("hasAnyRole('ADMIN', 'TRADER', 'USER')")
+    @GetMapping("/outbox")
+    public ResponseEntity<List<com.Trading.tradeservice.outbox.OutboxEvent>> getOutboxEvents() {
+        log.info("Fetching all outbox event records");
+        return ResponseEntity.ok(tradeService.getAllOutboxEvents());
+    }
 }
