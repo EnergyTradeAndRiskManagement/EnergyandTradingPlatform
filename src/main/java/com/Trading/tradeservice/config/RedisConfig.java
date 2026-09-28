@@ -1,6 +1,5 @@
 package com.Trading.tradeservice.config;
 
-
 import com.Trading.tradeservice.dtos.Response.CommodityResponse;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -20,8 +19,7 @@ public class RedisConfig {
         template.setConnectionFactory(connectionFactory);
 
         Jackson2JsonRedisSerializer<CommodityResponse> serializer = new Jackson2JsonRedisSerializer<>(
-                        CommodityResponse.class
-                );
+                CommodityResponse.class);
 
         template.setKeySerializer(new StringRedisSerializer());
 

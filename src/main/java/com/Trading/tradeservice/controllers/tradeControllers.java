@@ -14,8 +14,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
-
 @RestController
+@RequestMapping("/api/v1/trades")
 public class tradeControllers {
     private static final Logger log = LoggerFactory.getLogger(tradeControllers.class);
 
@@ -25,13 +25,12 @@ public class tradeControllers {
     public tradeControllers(TradeService tradeService, TradeValidator tradeValidator) {
         this.tradeService = tradeService;
         this.tradeValidator = tradeValidator;
-
     }
 
-    @PreAuthorize("hasRole('TRADER')")
-    @PostMapping("/api/v1/trades")
+    @PreAuthorize("hasAnyRole('TRADER', 'ADMIN', 'USER')")
+    @PostMapping
     public ResponseEntity<TradeResponse> createTrade(
-            @RequestHeader("IdempotencyKey") String idempotencyKey,
+            @RequestHeader(value = "IdempotencyKey", required = false) String idempotencyKey,
             @RequestBody TradeRequest tradeRequest) throws JsonProcessingException {
 
         log.info("Creating trade, counterparty={}, product={}, quantity={}",
@@ -41,24 +40,21 @@ public class tradeControllers {
 
         tradeService.captureTrade(idempotencyKey, tradeRequest);
         return ResponseEntity.ok(new TradeResponse());
-
-        // Implementation for creating a trade
     }
 
-    @PutMapping("/tradeId")
+    @PutMapping("/{tradeId}")
     public ResponseEntity<TradeResponse> updateTrade(
             @PathVariable Long tradeId,
-            @RequestBody TradeRequest request){
+            @RequestBody TradeRequest request) {
 
-
-           String result =  tradeService.updateTrade(tradeId, request);
+        String result = tradeService.updateTrade(tradeId, request);
 
         return ResponseEntity.ok(
                 new TradeResponse()
         );
     }
 
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'TRADER', 'USER')")
     @GetMapping("/{id}")
     public ResponseEntity<TradeResponse> getTrade(
             @PathVariable Long id) {
@@ -84,7 +80,4 @@ public class tradeControllers {
 
         return ResponseEntity.noContent().build();
     }
-
-
-
 }
