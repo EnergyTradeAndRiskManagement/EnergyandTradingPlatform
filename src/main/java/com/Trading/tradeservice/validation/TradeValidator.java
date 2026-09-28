@@ -35,7 +35,7 @@ public class TradeValidator {
 
         validateIdempotencyKey(idempotencyKey);
 //        validateCurrency(trade.getCurrency());
-        validateCommodity(trade.getCommodity());
+//        validateCommodity(trade.getCommodity());
 //        validateCounterparty(trade.getCounterparty_id());
 //        validateLocation(trade.getLocation());
 //        validateTradeDate(trade.getTradeDate());
