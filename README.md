@@ -121,3 +121,149 @@ json
     "timestamp": "2026-09-28T15:45:00"
   }
 ]
+
+
+
+~ -----------------------------------------------outbox pattern``````````````````````````````````````````````````````````````````~
+
+We have implemented Kafka, the Transactional Outbox Pattern, and Idempotent Consumers in energyandtradingplatform.
+
+Architectural Flow
+1. TRADE CAPTURE (Atomic Transaction)
+   Trader/API
+       │
+       ▼
+   TradeService (ACID Transaction)
+       ├─▶ 1. Saves Trade to `Trade` table
+       ├─▶ 2. Saves IdempotencyKey to `idempotency_keys` table
+       ├─▶ 3. Saves Audit to `trade_audit` table
+       └─▶ 4. Saves Event to `outbox_events` table (Status: PENDING)
+                               │
+               DATABASE TRANSACTION COMMITS
+                               │
+2. OUTBOX PUBLISHING (Zero Lost Events)
+                               ▼
+                    OutboxPublisherService
+                    (Immediate trigger + Scheduled Poller every 2s)
+                               │
+                               ▼ KafkaTemplate.send("trade-created", ...)
+                         Apache Kafka
+                         ├─▶ "trade-created"      ──▶ position-service
+                         └─▶ "trade-confirmation" ──▶ energyandtradingplatform (Consumer)
+                                                            │
+3. IDEMPOTENT CONSUMPTION                                   │
+                                                            ▼
+                                                TradeConfirmationConsumer
+                                                ├─ Checks `processed_events` table
+                                                ├─ If duplicate: skips side effects
+                                                └─ If new: updates status & saves eventId
+1. Kafka Configuration & Resilience
+Updated 
+
+application.properties
+Fixed invalid formatting and configured reliable producer settings:
+acks=all: Guarantees message persistence across all in-sync replicas before acknowledgement.
+enable.idempotence=true: Prevents duplicate messages produced by network retries.
+Configured consumer group energy-trading-group with JSON deserialization and trusted packages.
+Added outbox configuration:
+outbox.publisher.interval-ms=2000
+outbox.publisher.max-retries=5
+Created 
+
+KafkaConfig.java
+Defines auto-created topic beans:
+
+trade-created (3 partitions, replication factor 1)
+trade-confirmation (3 partitions, replication factor 1)
+Enabled in 
+
+TradeserviceApplication.java
+Added @EnableScheduling (for the outbox poller) and @EnableKafka.
+
+2. Transactional Outbox Pattern
+Why It Is Essential
+Without the Outbox pattern, calling kafkaTemplate.send() directly inside a database transaction suffers from the Dual-Write Problem:
+
+If Kafka fails or times out, the trade event is lost forever.
+If the database transaction rolls back after Kafka sends, downstream services receive "ghost" trades that do not exist.
+With the Outbox pattern, events are written to the database in the same ACID transaction as the trade. If the trade commits, the event is guaranteed to exist.
+
+Components Implemented:
+
+
+OutboxStatus.java
+: Enum with states PENDING, SENT, FAILED.
+
+
+OutboxEvent.java
+: PostgreSQL entity mapping to outbox_events storing aggregateId, eventType, topic, payload (JSON), retryCount, status, and timestamps.
+
+
+OutboxRepository.java
+: Queries top 50 pending events ordered by creation timestamp.
+
+
+OutboxService.java
+: Helper service invoked during trade create, update, and cancel operations to append outbox entries atomically.
+
+
+OutboxPublisherService.java
+:
+Immediate dispatch: Sends events to Kafka asynchronously right after transaction save.
+Scheduled poller (@Scheduled every 2s): Sweeps any pending/failed events (e.g. if Kafka broker was temporarily down).
+Status management: On Kafka broker confirmation, updates status to SENT. If it fails, increments retryCount up to maxRetries before marking FAILED.
+Integrated into 
+
+TradeService.java
+: All operations (captureTrade, updateTrade, cancelTrade) now write to the Outbox.
+3. Idempotent Consumer Pattern
+Why It Is Essential
+In distributed systems, Kafka guarantees At-Least-Once Delivery. Network partitions, consumer group rebalances, or producer retries can deliver the exact same message twice. Without consumer idempotency, duplicate side effects (e.g. double settling, double invoicing) will occur.
+
+Components Implemented:
+
+
+ProcessedEvent.java
+: Entity mapping to processed_events table with a unique constraint on (eventId, consumerGroup).
+
+
+ProcessedEventRepository.java
+: Checks existsByEventIdAndConsumerGroup(eventId, consumerGroup).
+
+
+IdempotentConsumerService.java
+: Provides isAlreadyProcessed() and markAsProcessed() methods executed inside the consumer's transaction.
+
+
+TradeConfirmationEvent.java
+: DTO carrying eventId, tradeId, confirmationStatus (CONFIRMED, SETTLED, REJECTED), and clearingReference.
+
+
+TradeConfirmationConsumer.java
+:
+@KafkaListener subscribed to "trade-confirmation" topic.
+Deduplication step: If eventId is already present in processed_events, it logs a warning and skips processing immediately.
+Processing step: If new, advances trade lifecycle status, logs an audit entry, and records the eventId in processed_events within the same atomic transaction.
+Real-Time Outbox Monitoring Endpoint
+Added a monitoring endpoint in 
+
+tradeControllers.java
+:
+
+Endpoint: GET /api/v1/trades/outbox
+Returns all outbox events, their current delivery status (PENDING, SENT, FAILED), retry count, and timestamps:
+json
+[
+  {
+    "id": 1,
+    "aggregateType": "TRADE",
+    "aggregateId": 101,
+    "eventType": "TRADE_CREATED",
+    "topic": "trade-created",
+    "status": "SENT",
+    "retryCount": 0,
+    "errorMessage": null,
+    "createdAt": "2026-09-28T16:15:00",
+    "sentAt": "2026-09-28T16:15:00.045"
+  }
+]
