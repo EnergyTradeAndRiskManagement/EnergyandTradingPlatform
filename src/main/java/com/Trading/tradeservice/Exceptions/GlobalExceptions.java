@@ -3,6 +3,7 @@ package com.Trading.tradeservice.Exceptions;
 import com.Trading.tradeservice.dtos.Response.ErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -40,5 +41,10 @@ public class GlobalExceptions {
                         "TRADE_CONCURRENT_MODIFICATION",
                         ex.getMessage()
                 ));
+    }
+
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    public ResponseEntity<String> handleOptimisticLocking(ObjectOptimisticLockingFailureException ex){
+        return ResponseEntity.status(HttpStatus.CONFLICT).body("Trade was modified by another user. Please retry.");
     }
 }

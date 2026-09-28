@@ -12,7 +12,6 @@ import java.time.LocalDateTime;
 @Data
 public class TradeRequest {
 
-
     @NotNull(message = "Trade type is required")
     private TradeType trade_type;
 
@@ -41,10 +40,5 @@ public class TradeRequest {
 
 
     private Long Version;
-
-
-
-
-
 
 }

@@ -34,12 +34,12 @@ public class TradeValidator {
     public void validate(String idempotencyKey, TradeRequest trade) {
 
         validateIdempotencyKey(idempotencyKey);
-        validateCurrency(trade.getCurrency());
+//        validateCurrency(trade.getCurrency());
         validateCommodity(trade.getCommodity());
-        validateCounterparty(trade.getCounterparty_id());
-        validateLocation(trade.getLocation());
-        validateTradeDate(trade.getTradeDate());
-        validateTradeType(trade.getTrade_type());
+//        validateCounterparty(trade.getCounterparty_id());
+//        validateLocation(trade.getLocation());
+//        validateTradeDate(trade.getTradeDate());
+//        validateTradeType(trade.getTrade_type());
     }
 
     private void validateIdempotencyKey(String idempotencyKey) {

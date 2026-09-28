@@ -1,25 +1,26 @@
-package com.Trading.tradeservice.services;
+package com.Trading.tradeservice.services.Trade;
 
 import com.Trading.tradeservice.Exceptions.IdempotencyException;
 import com.Trading.tradeservice.Exceptions.TradeConflictException;
 import com.Trading.tradeservice.Exceptions.TradeNotFoundException;
-import com.Trading.tradeservice.Exceptions.TradeValidationException;
 import com.Trading.tradeservice.dtos.Request.TradeRequest;
-import com.Trading.tradeservice.dtos.Request.UpdateTradeRequest;
 import com.Trading.tradeservice.dtos.Response.TradeResponse;
+import com.Trading.tradeservice.events.tradeEvent;
 import com.Trading.tradeservice.models.IdempotencyKey;
 import com.Trading.tradeservice.models.IdempotencyStatus;
 import com.Trading.tradeservice.models.Trade;
-import com.Trading.tradeservice.models.TradeType;
 import com.Trading.tradeservice.respositories.*;
 import com.Trading.tradeservice.validation.TradeValidator;
-import jakarta.transaction.Transactional;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
+@Transactional
 @Service
 public class TradeService {
 
@@ -29,14 +30,17 @@ public class TradeService {
 
     private final IdempotencyKeyRepository idempotencyKeyRepository;
 
-        public TradeService(TradeValidator tradeValidator, Traderepository tradeRepository, IdempotencyKeyRepository idempotencyKeyRepository) {
+    private final KafkaTemplate<String, tradeEvent> kafkaTemplate;
+
+        public TradeService(TradeValidator tradeValidator, Traderepository tradeRepository, IdempotencyKeyRepository idempotencyKeyRepository, KafkaTemplate<String, tradeEvent> kafkaTemplate) {
             this.tradeValidator = tradeValidator;
             this.tradeRepository = tradeRepository;
             this.idempotencyKeyRepository = idempotencyKeyRepository;
+            this.kafkaTemplate = kafkaTemplate;
         }
 
         @Transactional
-        public String captureTrade(String idempotencyKey, TradeRequest tradeRequest) {
+        public String captureTrade(String idempotencyKey, TradeRequest tradeRequest) throws JsonProcessingException {
             // Implementation for creating a trade
 
 
@@ -69,9 +73,65 @@ public class TradeService {
 
 
             idempotencyKeyRepository.save(newIdempotencyKey);
+            tradeEvent tradeevent = new tradeEvent();
+            tradeevent.setCommodity(trade.getCommodity());
+            tradeevent.setPrice(trade.getPrice());
+            tradeevent.setQuantity(trade.getQuantity());
+            tradeevent.setTradeId(trade.getId());
+
+            kafkaTemplate.send("trade-created", String.valueOf(tradeevent.getTradeId()), tradeevent).whenComplete((result, ex) -> {
+
+                if (ex != null) {
+                    System.out.println("❌ Failed to send Kafka event: " + ex.getMessage());
+                } else {
+                    System.out.println("✅ Kafka event sent successfully");
+                    System.out.println("Topic: " + result.getRecordMetadata().topic());
+                    System.out.println("Partition: " + result.getRecordMetadata().partition());
+                    System.out.println("Offset: " + result.getRecordMetadata().offset());
+                }
+            });
+
+            ;
+
+
+
 
             return String.valueOf(mapToResponse(savedTrade));
         }
+
+
+    public void deleteTrade(Long id) {
+
+        if (!tradeRepository.existsById(id)) {
+            throw new RuntimeException(
+                    "Trade not found: " + id
+            );
+        }
+
+        tradeRepository.deleteById(id);
+    }
+
+
+    @Transactional(readOnly = true)
+    public List<TradeResponse> getAllTrades() {
+
+        return tradeRepository.findAll()
+                .stream()
+                .map(this::mapToResponse)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public TradeResponse getTrade(Long id) {
+
+        Trade trade = tradeRepository.findById(id)
+                .orElseThrow(() ->
+                        new RuntimeException(
+                                "Trade not found: " + id
+                        ));
+
+        return mapToResponse(trade);
+    }
 
 
         public String updateTrade(Long tradeId, TradeRequest updateRequest){
@@ -81,7 +141,7 @@ public class TradeService {
                 throw new TradeNotFoundException("Trade not found");
             }
 
-            if (! trade.get().getVersion().equals(updateRequest.getVersion())) {
+            if (!trade.get().getVersion().equals(updateRequest.getVersion())) {
                 throw new TradeConflictException(
                         "Trade was modified by another user");
             }
